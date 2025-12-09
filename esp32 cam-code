@@ -1,0 +1,225 @@
+#include <WiFi.h>
+#include <WebSocketsClient.h>
+#include <Wire.h>
+#include <SD_MMC.h>
+#include "MPU6050_tockn.h"
+#include <time.h>
+
+/******** WIFI ********/
+const char* WIFI_SSID = "sudeep";
+const char* WIFI_PASS = "12345678";
+
+/******** WEBSOCKET SSL ********/
+WebSocketsClient ws;
+const char* WS_HOST = "your.onrender.com";
+const int   WS_PORT = 443;
+const char* WS_PATH = "/";
+
+/******** I2C PINS (SAFE FOR ESP32-CAM) ********/
+#define SDA_PIN 0
+#define SCL_PIN 16
+
+MPU6050 mpu(Wire);
+
+/******** DATA FROM WEBSOCKET ********/
+String wsHealth = "{}";
+String wsLat = "0";
+String wsLon = "0";
+
+/******** PRE / POST CRASH BUFFER ********/
+const int SAMPLE_RATE = 50;
+const int PRE_SEC = 5;
+const int POST_SEC = 5;
+
+const int PRE_SIZE = SAMPLE_RATE * PRE_SEC;
+const int POST_SIZE = SAMPLE_RATE * POST_SEC;
+
+unsigned long lastSample = 0;
+bool crashDetected = false;
+
+struct Sample {
+  unsigned long ms;
+  float ax, ay, az;
+  float gx, gy, gz;
+  String lat, lon;
+  String health;
+  String timestamp;   // Timestamp
+};
+
+Sample ring[PRE_SIZE];
+int head = 0;
+int countSamples = 0;
+
+float CRASH_THRESHOLD = 1.5;
+
+/************ GET DATE & TIME ************/
+String getTimeStamp() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return "NO_TIME";
+
+  char buffer[25];
+  strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &timeinfo);
+  return String(buffer);
+}
+
+/************ WEBSOCKET EVENT ************/
+void wsEvent(WStype_t type, uint8_t *payload, size_t len) {
+  if (type == WStype_TEXT) {
+    String msg = (char*)payload;
+    Serial.print("WS RECEIVED: ");
+    Serial.println(msg);
+
+    // Use raw health data directly
+    wsHealth = msg;  
+
+    // Extract lat/lng from string
+    int a = msg.indexOf("\"lat\":");
+    int b = msg.indexOf(",", a);
+    if (a > 0) wsLat = msg.substring(a + 6, b);
+
+    a = msg.indexOf("\"lng\":");
+    b = msg.indexOf("}", a);
+    if (a > 0) wsLon = msg.substring(a + 6, b);
+  }
+
+  if (type == WStype_CONNECTED) {
+    Serial.println("[WS] Connected");
+  }
+
+  if (type == WStype_DISCONNECTED) {
+    Serial.println("[WS] Disconnected → Reconnecting...");
+    ws.beginSSL(WS_HOST, WS_PORT, WS_PATH);
+  }
+}
+
+/************ ADD SAMPLE TO PRE-CRASH RING ************/
+void pushSample(const Sample &s) {
+  ring[head] = s;
+  head = (head + 1) % PRE_SIZE;
+  if (countSamples < PRE_SIZE) countSamples++;
+}
+
+/************ SAVE CSV ************/
+String saveCSV() {
+  String filename = "/crash_" + getTimeStamp() + ".csv"; // Use timestamp in filename
+  filename.replace(":", "-"); // Replace : for valid filename
+  filename.replace(" ", "_");
+
+  File f = SD_MMC.open(filename, FILE_WRITE);
+  if (!f) {
+    Serial.println("SD write failed!");
+    return "";
+  }
+
+  f.println("ms,ax,ay,az,gx,gy,gz,lat,lon,health,timestamp"); // Timestamp column
+
+  int start = (head + PRE_SIZE - countSamples) % PRE_SIZE;
+  for (int i = 0; i < countSamples; i++) {
+    int idx = (start + i) % PRE_SIZE;
+    Sample s = ring[idx];
+
+    // Write properly with .c_str() for strings
+    f.print(s.ms); f.print(",");
+    f.print(s.ax); f.print(",");
+    f.print(s.ay); f.print(",");
+    f.print(s.az); f.print(",");
+    f.print(s.gx); f.print(",");
+    f.print(s.gy); f.print(",");
+    f.print(s.gz); f.print(",");
+    f.print(s.lat); f.print(",");
+    f.print(s.lon); f.print(",");
+    f.print(s.health); f.print(",");
+    f.println(s.timestamp);
+  }
+
+  f.close();
+  return filename;
+}
+
+/************ SETUP ************/
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(4, OUTPUT);
+  digitalWrite(4, LOW);
+
+  Serial.println("Connecting WiFi...");
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(400);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected:");
+  Serial.println(WiFi.localIP());
+
+  // NTP TIME INITIALIZATION
+  configTime(19800, 0, "pool.ntp.org", "time.nist.gov"); // IST UTC+5:30
+  delay(2000);
+  Serial.println("Time sync initialized");
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  delay(200);
+
+  mpu.begin();
+  Serial.println("MPU6050 initialized.");
+  Serial.println("DO NOT MOVE MPU6050...");
+  mpu.calcGyroOffsets(true);
+  Serial.println("Done!");
+
+  if (!SD_MMC.begin()) {
+    Serial.println("SD FAIL");
+  } else {
+    Serial.println("SD_MMC mounted");
+  }
+
+  ws.beginSSL(WS_HOST, WS_PORT, WS_PATH);
+  ws.onEvent(wsEvent);
+  ws.setReconnectInterval(3000);
+
+  Serial.println("System ready");
+}
+
+/************ MAIN LOOP ************/
+void loop() {
+  ws.loop();
+
+  unsigned long now = millis();
+  if (now - lastSample < (1000 / SAMPLE_RATE)) return;
+  lastSample = now;
+
+  mpu.update();
+
+  float ax = mpu.getAccX();
+  float ay = mpu.getAccY();
+  float az = mpu.getAccZ();
+  float gx = mpu.getGyroX();
+  float gy = mpu.getGyroY();
+  float gz = mpu.getGyroZ();
+  float magnitude = sqrt(ax*ax + ay*ay + az*az);
+
+  Sample s = { now, ax, ay, az, gx, gy, gz, wsLat, wsLon, wsHealth, getTimeStamp() };
+  pushSample(s);
+
+  if (!crashDetected && magnitude > CRASH_THRESHOLD) {
+    crashDetected = true;
+
+    String timestamp = getTimeStamp();
+    Serial.println("⚠️ CRASH DETECTED at: " + timestamp);
+
+    for (int i = 0; i < POST_SIZE; i++) {
+      mpu.update();
+      Sample ps = { millis(), mpu.getAccX(), mpu.getAccY(), mpu.getAccZ(),
+                    mpu.getGyroX(), mpu.getGyroY(), mpu.getGyroZ(),
+                    wsLat, wsLon, wsHealth, getTimeStamp() };
+      pushSample(ps);
+      delay(1000 / SAMPLE_RATE);
+    }
+
+    String file = saveCSV();
+    Serial.println("Saved crash file: " + file);
+
+    crashDetected = false;
+    countSamples = 0;
+  }
+}
