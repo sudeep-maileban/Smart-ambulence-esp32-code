@@ -1,0 +1,117 @@
+#include <WiFi.h>
+#include <WebSocketsClient.h>
+#include <Wire.h>
+#include "MAX30100_PulseOximeter.h"
+#include "DHT.h"
+#include <TinyGPSPlus.h>
+#include <HardwareSerial.h>
+
+// ========== CONFIGURATION ==========
+#define WIFI_SSID "sudeep"
+#define WIFI_PASSWORD "12345678"
+
+#define DHTPIN 4
+#define DHTTYPE DHT11
+
+#define GPS_RX 16
+#define GPS_TX 17
+
+#define SDA_PIN 21
+#define SCL_PIN 22
+
+PulseOximeter pox;
+DHT dht(DHTPIN, DHTTYPE);
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(1);
+WebSocketsClient webSocket;
+
+// Shared variables
+float sharedHR = 0;
+float sharedSPO2 = 0;
+
+TaskHandle_t maxTask;
+
+// ========== SEPARATE MAX30100 TASK ==========
+void max30100Task(void *param) {
+  for (;;) {
+    pox.update();
+    sharedHR = pox.getHeartRate();
+    sharedSPO2 = pox.getSpO2();
+    vTaskDelay(1);  // 1ms delay to allow stable operation
+  }
+}
+
+// ========== WebSocket Events ==========
+void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
+  if (type == WStype_CONNECTED) Serial.println("WS Connected");
+}
+
+// ========== Setup ==========
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Starting Smart Ambulance...");
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  Serial.println("Initializing MAX30100...");
+  if (!pox.begin()) {
+    Serial.println("MAX30100 not responding!");
+    while (1);
+  }
+  pox.setIRLedCurrent(MAX30100_LED_CURR_27_1MA);
+
+  // Start MAX30100 on Core 0
+  xTaskCreatePinnedToCore(
+    max30100Task,
+    "max30100Task",
+    4096,
+    NULL,
+    1,
+    &maxTask,
+    0   // CORE 0
+  );
+
+  dht.begin();
+  gpsSerial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) delay(100);
+
+  webSocket.beginSSL("example.onrender.com", 443, "/");
+  webSocket.onEvent(webSocketEvent);
+}
+
+// ========== Loop ==========
+void loop() {
+
+  webSocket.loop();
+
+  // GPS
+  while (gpsSerial.available())
+    gps.encode(gpsSerial.read());
+
+  static unsigned long lastSend = 0;
+  static unsigned long lastDHT = 0;
+
+  // DHT (every 1s)
+  if (millis() - lastDHT >= 1000) {
+    lastDHT = millis();
+  }
+
+  // SEND DATA EVERY 2s
+  if (millis() - lastSend >= 2000) {
+    lastSend = millis();
+
+    String data = "{";
+    data += "\"heartRate\":" + String(sharedHR, 1) + ",";
+    data += "\"spo2\":" + String(sharedSPO2, 1) + ",";
+    data += "\"temperature\":" + String(dht.readTemperature(), 1) + ",";
+    data += "\"humidity\":" + String(dht.readHumidity(), 1) + ",";
+    data += "\"lat\":" + String(gps.location.isValid() ? gps.location.lat() : 0, 6) + ",";
+    data += "\"lng\":" + String(gps.location.isValid() ? gps.location.lng() : 0, 6);
+    data += "}";
+
+    webSocket.sendTXT(data);
+    Serial.println("Sent: " + data);
+  }
+}
